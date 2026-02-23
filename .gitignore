@@ -1,0 +1,68 @@
+# Environment files
+.env
+*.env
+!config.example.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Output directory (user-generated content)
+output/*/
+!output/.gitkeep
+
+# Input directory (user images)
+images_to_process/*.jpg
+images_to_process/*.jpeg
+images_to_process/*.png
+images_to_process/*.gif
+images_to_process/*.bmp
+images_to_process/*.webp
+images_to_process/*.tiff
+images_to_process/*.heic
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
