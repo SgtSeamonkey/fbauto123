@@ -17,6 +17,14 @@ import google.genai as genai
 
 logger = logging.getLogger(__name__)
 
+
+class RateLimitError(Exception):
+    """Raised when the API returns a 429 / RESOURCE_EXHAUSTED error."""
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
+        super().__init__(f"Rate limit reached for model: {model_name}")
+
 SUPPORTED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"
 }
@@ -76,6 +84,15 @@ class ImageAnalyzer:
             "ImageAnalyzer initialized (model=%s, max_rpm=%d)", model_name, max_rpm
         )
 
+    def switch_model(self, new_model_name: str) -> None:
+        """Switch to a different Gemini model at runtime.
+
+        Args:
+            new_model_name: The name of the new model to use.
+        """
+        self.model_name = new_model_name
+        logger.info("Switched to model: %s", new_model_name)
+
     def analyze_image(self, image_path: Path) -> Optional[dict]:
         """
         Analyze a single image and return structured marketplace listing data.
@@ -118,6 +135,9 @@ class ImageAnalyzer:
             )
             return result
         except Exception as exc:
+            exc_str = str(exc)
+            if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str:
+                raise RateLimitError(self.model_name)
             logger.error("Error analyzing image %s: %s", image_path.name, exc)
             return None
 
