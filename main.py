@@ -8,10 +8,12 @@ Set your GEMINI_API_KEY in a .env file (copy config.example.env to .env and fill
 """
 
 import argparse
+import json
 import logging
 import os
+import shutil
 import sys
-import time
+from datetime import date
 from pathlib import Path
 
 from tqdm import tqdm
@@ -24,15 +26,21 @@ except ImportError:
     pass  # python-dotenv not installed; rely on environment variables
 
 from src.excel_generator import ExcelGenerator
-from src.image_analyzer import ImageAnalyzer
+from src.image_analyzer import ImageAnalyzer, RateLimitError
 from src.image_organizer import ImageOrganizer
 from src.listing_generator import ListingGenerator
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# Constants
 # ---------------------------------------------------------------------------
 LOG_FILE = "marketplace_automation.log"
+PROCESSED_FOLDER = "processed_images"
+PROGRESS_FILE = "progress.json"
+DEFAULT_MODELS = ["gemini-2.5-flash-lite", "gemini-3-flash", "gemini-2.5-flash"]
 
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -50,117 +58,153 @@ logger = logging.getLogger(__name__)
 
 def _get_config() -> dict:
     """Read configuration from environment variables."""
+    raw_models = os.environ.get("GEMINI_MODELS", "").strip()
+    if raw_models:
+        models = [m.strip() for m in raw_models.split(",") if m.strip()]
+    else:
+        # Backward-compatible: fall back to single GEMINI_MODEL env var
+        single = os.environ.get("GEMINI_MODEL", "").strip()
+        models = [single] if single else DEFAULT_MODELS
+
     return {
         "api_key": os.environ.get("GEMINI_API_KEY", ""),
         "input_folder": os.environ.get("INPUT_FOLDER", "images_to_process"),
         "output_folder": os.environ.get("OUTPUT_FOLDER", "output"),
         "max_rpm": int(os.environ.get("MAX_RPM", "14")),
-        "batch_size": int(os.environ.get("BATCH_SIZE", "10")),
         "batch_delay": float(os.environ.get("BATCH_DELAY", "5")),
-        "model_name": os.environ.get("GEMINI_MODEL", "gemini-1.5-flash"),
+        "batch_size": int(os.environ.get("BATCH_SIZE", "10")),
+        "models": models,
     }
 
 
 # ---------------------------------------------------------------------------
-# Core processing logic
+# Progress tracking helpers
 # ---------------------------------------------------------------------------
 
-def _process_batch(
-    batch: list[Path],
-    analyzer: ImageAnalyzer,
+def _load_progress(progress_file: Path) -> dict:
+    """Load progress data from progress.json, returning defaults if missing."""
+    if progress_file.exists():
+        try:
+            return json.loads(progress_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {
+        "total_images": 0,
+        "processed_count": 0,
+        "last_run": "",
+        "models_used": {},
+    }
+
+
+def _save_progress(progress_file: Path, data: dict) -> None:
+    """Persist progress data to progress.json."""
+    try:
+        progress_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not save progress file: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Processed-image helpers
+# ---------------------------------------------------------------------------
+
+SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"}
+
+
+def _move_to_processed(image_path: Path, processed_folder: Path) -> bool:
+    """
+    Move *image_path* into *processed_folder*.
+
+    Handles name collisions by appending a numeric suffix.  Returns True on
+    success, False if the move failed.
+    """
+    dest = processed_folder / image_path.name
+    if dest.exists():
+        stem = image_path.stem
+        suffix = image_path.suffix
+        counter = 1
+        while dest.exists():
+            dest = processed_folder / f"{stem}_{counter}{suffix}"
+            counter += 1
+    try:
+        shutil.move(str(image_path), str(dest))
+        logger.info("Moved %s → %s/%s", image_path.name, processed_folder.name, dest.name)
+        return True
+    except OSError as exc:
+        logger.warning("Could not move %s to processed folder: %s", image_path.name, exc)
+        return False
+
+
+def _get_processed_image_names(processed_folder: Path, output_folder: Path) -> set[str]:
+    """
+    Return filenames of images that have already been processed.
+
+    Checks both *processed_folder* (primary, new) and *output_folder*
+    sub-directories (legacy, for backward compatibility with runs made before
+    the processed_images/ folder was introduced).
+    """
+    processed: set[str] = set()
+
+    if processed_folder.exists():
+        for f in processed_folder.iterdir():
+            if f.is_file() and f.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+                processed.add(f.name)
+
+    if output_folder.exists():
+        for item_dir in output_folder.iterdir():
+            if item_dir.is_dir():
+                for f in item_dir.iterdir():
+                    if f.is_file() and f.suffix.lower() in SUPPORTED_IMAGE_EXTS:
+                        processed.add(f.name)
+
+    return processed
+
+
+# ---------------------------------------------------------------------------
+# Organisation helper (grouping + listing generation)
+# ---------------------------------------------------------------------------
+
+def _organize_and_list(
+    analyses: list[dict],
     organizer: ImageOrganizer,
     listing_gen: ListingGenerator,
-    batch_delay: float,
 ) -> list[dict]:
     """
-    Process a batch of images: analyze, group, copy to folders, write listings.
+    Group analyses by item, create output folders, write listings.
 
-    Args:
-        batch: List of image paths to process.
-        analyzer: ImageAnalyzer instance.
-        organizer: ImageOrganizer instance.
-        listing_gen: ListingGenerator instance.
-        batch_delay: Seconds to wait after processing the batch.
-
-    Returns:
-        List of summary dicts (one per item group found in this batch).
+    Returns a list of summary dicts (one per item group).
     """
     summaries: list[dict] = []
 
-    # --- Step 1: Analyze each image individually ---
-    analyses: list[dict] = []
-    for image_path in batch:
-        logger.info("Analyzing image: %s", image_path.name)
-        result = analyzer.analyze_image(image_path)
-        if result:
-            analyses.append(result)
-        else:
-            logger.warning("Skipping image (analysis failed): %s", image_path.name)
-
-    if not analyses:
-        return summaries
-
-    # --- Step 2: Group analyses by item key ---
     groups = organizer.group_analyses_by_item(analyses)
 
-    # --- Step 3: Detect potential duplicates across groups ---
     duplicate_warnings = organizer.detect_similar_groups(groups)
     for warning in duplicate_warnings:
         logger.warning(warning)
         print(f"  ⚠  {warning}")
 
-    # --- Step 4: For each group, create folder, copy images, write listing ---
     for item_key, item_analyses in groups.items():
         item_name = item_analyses[0].get("item_name", item_key)
 
-        # Check if this item was already processed in a previous run
         existing_folder = organizer.get_or_create_item_folder(item_key)
         if existing_folder and organizer.is_already_processed(existing_folder):
             logger.info("Skipping already-processed item: %s", item_key)
             print(f"  ↷  Skipping (already processed): {item_key}")
             continue
 
-        # Create the output folder
         item_folder = organizer.create_item_folder(item_key, item_name)
 
-        # Copy images into the item folder
         for analysis in item_analyses:
             src = Path(analysis["image_path"])
             if src.exists():
                 organizer.copy_image_to_folder(src, item_folder)
 
-        # Generate listing.txt
         listing_gen.generate_listing(item_folder, item_analyses)
-
-        # Collect summary for Excel
         summary = listing_gen.get_listing_summary(item_folder, item_analyses)
         summaries.append(summary)
-
         print(f"  ✓  {item_name} → {item_folder.name}/")
 
-    # --- Step 5: Pause between batches to respect rate limits ---
-    if batch_delay > 0:
-        time.sleep(batch_delay)
-
     return summaries
-
-
-def _get_already_processed_image_names(output_folder: Path) -> set[str]:
-    """
-    Return the set of image filenames that have already been copied to output.
-
-    Used for resume capability: images that exist anywhere in the output tree
-    are considered already processed.
-    """
-    processed: set[str] = set()
-    for item_dir in output_folder.iterdir():
-        if item_dir.is_dir():
-            for f in item_dir.iterdir():
-                if f.is_file() and f.suffix.lower() in {
-                    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".heic"
-                }:
-                    processed.add(f.name)
-    return processed
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +230,11 @@ def main() -> None:
 
     config = _get_config()
 
-    # Command-line args override environment variables
     input_folder = Path(args.input or config["input_folder"])
     output_folder = Path(args.output or config["output_folder"])
+    processed_folder = Path(PROCESSED_FOLDER)
     api_key = config["api_key"]
+    models = config["models"]
 
     print("=" * 60)
     print("  Facebook Marketplace Listing Automation")
@@ -219,17 +264,21 @@ def main() -> None:
         print("  Supported formats: JPG, JPEG, PNG, GIF, BMP, WEBP, TIFF, HEIC\n")
         sys.exit(0)
 
-    print(f"\n📂 Input folder : {input_folder}/")
-    print(f"📦 Output folder: {output_folder}/")
-    print(f"🖼  Images found : {len(all_images)}")
-    print(f"🤖 Using model  : {config['model_name']} (free tier)")
-    print(f"⏱  Rate limit   : {config['max_rpm']} requests/minute")
-    print()
+    # --- Create output/processed folders ---
+    output_folder.mkdir(parents=True, exist_ok=True)
+    processed_folder.mkdir(exist_ok=True)
 
     # --- Resume capability: skip already-processed images ---
-    output_folder.mkdir(parents=True, exist_ok=True)
-    processed_names = _get_already_processed_image_names(output_folder)
+    processed_names = _get_processed_image_names(processed_folder, output_folder)
     remaining_images = [img for img in all_images if img.name not in processed_names]
+
+    print(f"\n📂 Input folder    : {input_folder}/")
+    print(f"📦 Output folder   : {output_folder}/")
+    print(f"📁 Processed folder: {processed_folder}/")
+    print(f"🖼  Images found    : {len(all_images)}")
+    print(f"🤖 Models          : {', '.join(models)}")
+    print(f"⏱  Rate limit      : {config['max_rpm']} requests/minute")
+    print()
 
     if processed_names:
         skipped = len(all_images) - len(remaining_images)
@@ -237,54 +286,118 @@ def main() -> None:
 
     if not remaining_images:
         print("✅ All images have already been processed!")
-    else:
-        # --- Initialise components ---
-        analyzer = ImageAnalyzer(api_key=api_key, max_rpm=config["max_rpm"], model_name=config["model_name"])
-        organizer = ImageOrganizer(output_folder=output_folder)
-        listing_gen = ListingGenerator()
-        excel_gen = ExcelGenerator(output_folder=output_folder)
-
-        # --- Process in batches ---
-        batch_size = config["batch_size"]
-        batches = [
-            remaining_images[i: i + batch_size]
-            for i in range(0, len(remaining_images), batch_size)
-        ]
-
-        all_summaries: list[dict] = []
-        estimated_minutes = len(remaining_images) / config["max_rpm"]
         print(
-            f"🚀 Processing {len(remaining_images)} images in {len(batches)} batch(es).\n"
-            f"   Estimated time: ~{estimated_minutes:.0f} minute(s) (within free tier limits).\n"
+            f"\n✅ Done! Check the '{output_folder}/' folder for organized items.\n"
+            f"   Log file: {LOG_FILE}\n"
         )
+        return
 
-        with tqdm(total=len(remaining_images), desc="Processing images", unit="img") as pbar:
-            for batch_num, batch in enumerate(batches, start=1):
-                logger.info(
-                    "Processing batch %d/%d (%d images)", batch_num, len(batches), len(batch)
-                )
-                batch_summaries = _process_batch(
-                    batch=batch,
-                    analyzer=analyzer,
-                    organizer=organizer,
-                    listing_gen=listing_gen,
-                    batch_delay=config["batch_delay"],
-                )
-                all_summaries.extend(batch_summaries)
-                pbar.update(len(batch))
+    # --- Initialise components ---
+    model_index = 0
+    current_model = models[model_index]
+    analyzer = ImageAnalyzer(api_key=api_key, max_rpm=config["max_rpm"], model_name=current_model)
+    organizer = ImageOrganizer(output_folder=output_folder)
+    listing_gen = ListingGenerator()
+    excel_gen = ExcelGenerator(output_folder=output_folder)
 
-        # --- Generate / update Excel summary ---
-        if all_summaries:
-            excel_path = excel_gen.append_or_update(all_summaries)
-            print(f"\n📊 Summary spreadsheet saved: {excel_path}")
-        else:
-            print("\n⚠  No items were successfully processed.")
+    logger.info("Using model: %s", current_model)
+    print(f"🚀 Starting with model: {current_model}")
+    print(f"   Processing {len(remaining_images)} image(s)...\n")
+
+    # --- Analyse images one by one, switching models on rate-limit errors ---
+    all_analyses: list[dict] = []
+    successfully_analyzed: list[Path] = []
+    models_used: dict[str, int] = {}
+    all_exhausted = False
+
+    with tqdm(total=len(remaining_images), desc="Analyzing images", unit="img") as pbar:
+        for image_path in remaining_images:
+            if all_exhausted:
+                break
+
+            # Inner retry loop: retry the same image after a model switch
+            while True:
+                try:
+                    result = analyzer.analyze_image(image_path)
+                    if result:
+                        all_analyses.append(result)
+                        successfully_analyzed.append(image_path)
+                        models_used[current_model] = models_used.get(current_model, 0) + 1
+                    else:
+                        logger.warning(
+                            "Skipping image (analysis failed): %s", image_path.name
+                        )
+                    pbar.update(1)
+                    break  # Move on to next image
+
+                except RateLimitError as exc:
+                    print(
+                        f"\n⚠️  Model '{exc.model_name}' has hit its rate limit."
+                    )
+                    logger.warning("Rate limit hit for model: %s", exc.model_name)
+                    model_index += 1
+                    if model_index < len(models):
+                        current_model = models[model_index]
+                        print(f"✓  Switching to next model: '{current_model}'\n")
+                        logger.info("Switching to model: %s", current_model)
+                        analyzer.switch_model(current_model)
+                        # Retry the same image with the new model
+                    else:
+                        print("\n⚠️  All available models have reached their daily limits.")
+                        logger.warning("All models exhausted.")
+                        all_exhausted = True
+                        pbar.update(1)
+                        break
+
+    # --- Organize and generate listings ---
+    all_summaries: list[dict] = []
+    if all_analyses:
+        print("\n📁 Organizing items and generating listings...")
+        all_summaries = _organize_and_list(all_analyses, organizer, listing_gen)
+
+    # --- Move successfully analyzed images to processed_images/ ---
+    moved_count = 0
+    for image_path in successfully_analyzed:
+        if _move_to_processed(image_path, processed_folder):
+            moved_count += 1
+
+    # --- Generate / update Excel summary ---
+    if all_summaries:
+        excel_path = excel_gen.append_or_update(all_summaries)
+        print(f"\n📊 Summary spreadsheet saved: {excel_path}")
+    elif not all_analyses:
+        print("\n⚠  No items were successfully processed.")
+
+    # --- Save progress.json ---
+    progress_file = Path(PROGRESS_FILE)
+    progress = _load_progress(progress_file)
+    # Update cumulative totals
+    prev_processed = progress.get("processed_count", 0)
+    progress["processed_count"] = prev_processed + len(successfully_analyzed)
+    remaining_after = len(ImageAnalyzer.get_supported_images(input_folder))
+    progress["total_images"] = progress["processed_count"] + remaining_after
+    progress["last_run"] = str(date.today())
+    for model_name, count in models_used.items():
+        progress.setdefault("models_used", {})[model_name] = (
+            progress["models_used"].get(model_name, 0) + count
+        )
+    _save_progress(progress_file, progress)
+
+    # --- Final summary ---
+    print(f"\n✓  Processing complete!")
+    print(f"   - Total images processed this run : {len(successfully_analyzed)}")
+    print(f"   - Images moved to {processed_folder}/  : {moved_count}")
+    print(f"   - Images remaining in {input_folder}/  : {remaining_after}")
+    if all_exhausted:
+        print(f"   - All available models have reached their daily limits")
+        print(f"   - Run this script again tomorrow to continue processing")
 
     print(
         f"\n✅ Done! Check the '{output_folder}/' folder for organized items.\n"
-        f"   Log file: marketplace_automation.log\n"
+        f"   Log file: {LOG_FILE}\n"
     )
 
 
 if __name__ == "__main__":
     main()
+

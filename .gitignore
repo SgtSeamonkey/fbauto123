@@ -48,6 +48,12 @@ logs/
 output/*/
 !output/.gitkeep
 
+# Processed images directory (user-generated content)
+processed_images/
+
+# Progress tracking file (auto-generated)
+progress.json
+
 # Input directory (user images)
 images_to_process/*.jpg
 images_to_process/*.jpeg
