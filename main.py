@@ -28,6 +28,7 @@ except ImportError:
 from src.excel_generator import ExcelGenerator
 from src.image_analyzer import ImageAnalyzer, RateLimitError
 from src.image_organizer import ImageOrganizer
+from src.item_catalog import ItemCatalog
 from src.listing_generator import ListingGenerator
 
 # ---------------------------------------------------------------------------
@@ -37,6 +38,8 @@ LOG_FILE = "marketplace_automation.log"
 PROCESSED_FOLDER = "processed_images"
 PROGRESS_FILE = "progress.json"
 DEFAULT_MODELS = ["gemini-2.5-flash-lite", "gemini-3-flash", "gemini-2.5-flash"]
+DEFAULT_DUPLICATE_MERGE_THRESHOLD = 0.80
+DEFAULT_ITEM_CATALOG_FILENAME = "item_catalog.json"
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -74,6 +77,12 @@ def _get_config() -> dict:
         "batch_delay": float(os.environ.get("BATCH_DELAY", "5")),
         "batch_size": int(os.environ.get("BATCH_SIZE", "10")),
         "models": models,
+        "duplicate_merge_threshold": float(
+            os.environ.get("DUPLICATE_MERGE_THRESHOLD", str(DEFAULT_DUPLICATE_MERGE_THRESHOLD))
+        ),
+        "item_catalog_filename": os.environ.get(
+            "ITEM_CATALOG_FILENAME", DEFAULT_ITEM_CATALOG_FILENAME
+        ),
     }
 
 
@@ -168,9 +177,14 @@ def _organize_and_list(
     analyses: list[dict],
     organizer: ImageOrganizer,
     listing_gen: ListingGenerator,
+    catalog: ItemCatalog,
 ) -> list[dict]:
     """
     Group analyses by item, create output folders, write listings.
+
+    For each group, checks the item catalog for a cross-run duplicate.  When a
+    match is found at or above the configured threshold the new images are merged
+    into the existing folder instead of creating a fresh one.
 
     Returns a list of summary dicts (one per item group).
     """
@@ -183,9 +197,69 @@ def _organize_and_list(
         logger.warning(warning)
         print(f"  ⚠  {warning}")
 
+    today_str = date.today().isoformat()
+
     for item_key, item_analyses in groups.items():
         item_name = item_analyses[0].get("item_name", item_key)
+        canonical_text = ItemCatalog.build_canonical_text(item_key, item_analyses)
+        image_names = [a.get("image_name", "") for a in item_analyses if a.get("image_name")]
 
+        # --- Cross-run duplicate check ---
+        match = catalog.find_match(canonical_text, item_key)
+        if match is not None:
+            existing_entry, similarity = match
+            existing_key = existing_entry["item_key"]
+            existing_folder = organizer.get_or_create_item_folder(existing_key)
+
+            if existing_folder is not None:
+                # Merge: copy images into the existing folder
+                for analysis in item_analyses:
+                    src = Path(analysis["image_path"])
+                    if src.exists():
+                        organizer.copy_image_to_folder(src, existing_folder)
+
+                # Write a listing_update file (never overwrite listing.txt)
+                update_filename = f"listing_update_{today_str}.txt"
+                update_path = existing_folder / update_filename
+                # Handle multiple updates on the same day
+                if update_path.exists():
+                    counter = 2
+                    while update_path.exists():
+                        update_path = existing_folder / f"listing_update_{today_str}_{counter}.txt"
+                        counter += 1
+
+                merged = listing_gen._merge_analyses(item_analyses)
+                update_text = (
+                    f"MERGED INTO: {existing_key}\n"
+                    f"SIMILARITY SCORE: {similarity:.4f}\n"
+                    f"MERGE DATE: {today_str}\n"
+                    f"\n"
+                    f"--- New Analysis Summary ---\n"
+                    f"TITLE: {merged['title']}\n"
+                    f"\n"
+                    f"DESCRIPTION:\n{merged['description']}\n"
+                    f"\n"
+                    f"PRICE: ${merged['price']:.2f}\n"
+                    f"CONDITION: {merged['condition']}\n"
+                    f"CATEGORY: {merged['category']}\n"
+                    f"IMAGES: {merged['images']}\n"
+                )
+                update_path.write_text(update_text, encoding="utf-8")
+
+                # Update catalog entry with new images
+                catalog.update_entry_images(existing_key, image_names)
+
+                logger.info(
+                    "Merged '%s' into existing '%s' (similarity: %.2f)",
+                    item_key, existing_key, similarity,
+                )
+                print(f"  🔁 Merged '{item_key}' into existing '{existing_key}' (similarity: {similarity:.2f})")
+
+                summary = listing_gen.get_listing_summary(existing_folder, item_analyses)
+                summaries.append(summary)
+                continue
+
+        # --- No match: create a new item folder as normal ---
         existing_folder = organizer.get_or_create_item_folder(item_key)
         if existing_folder and organizer.is_already_processed(existing_folder):
             logger.info("Skipping already-processed item: %s", item_key)
@@ -202,6 +276,11 @@ def _organize_and_list(
         listing_gen.generate_listing(item_folder, item_analyses)
         summary = listing_gen.get_listing_summary(item_folder, item_analyses)
         summaries.append(summary)
+
+        # Add new entry to catalog
+        title = listing_gen._merge_analyses(item_analyses)["title"]
+        catalog.add_entry(item_key, title, canonical_text, image_names)
+
         print(f"  ✓  {item_name} → {item_folder.name}/")
 
     return summaries
@@ -299,6 +378,10 @@ def main() -> None:
     organizer = ImageOrganizer(output_folder=output_folder)
     listing_gen = ListingGenerator()
     excel_gen = ExcelGenerator(output_folder=output_folder)
+    catalog = ItemCatalog(
+        catalog_path=output_folder / config["item_catalog_filename"],
+        threshold=config["duplicate_merge_threshold"],
+    )
 
     logger.info("Using model: %s", current_model)
     print(f"🚀 Starting with model: {current_model}")
@@ -353,7 +436,8 @@ def main() -> None:
     all_summaries: list[dict] = []
     if all_analyses:
         print("\n📁 Organizing items and generating listings...")
-        all_summaries = _organize_and_list(all_analyses, organizer, listing_gen)
+        all_summaries = _organize_and_list(all_analyses, organizer, listing_gen, catalog)
+        catalog.save()
 
     # --- Move successfully analyzed images to processed_images/ ---
     moved_count = 0
