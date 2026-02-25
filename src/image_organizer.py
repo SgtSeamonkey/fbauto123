@@ -127,11 +127,13 @@ class ImageOrganizer:
         self, analyses: list[dict]
     ) -> dict[str, list[dict]]:
         """
-        Group image analysis results by item key.
+        Group image analysis results by item key, merging groups with similar keys.
 
-        Images with the same item_key (from Gemini analysis) are grouped together.
-        This is a heuristic grouping; compare_images_for_grouping in ImageAnalyzer
-        provides more accurate grouping via visual comparison.
+        Uses token-overlap (Jaccard) similarity so that images whose Gemini-assigned
+        keys differ only slightly (e.g. different word order or a synonym) are still
+        grouped together rather than treated as separate items.  Any new key that
+        scores at or above DUPLICATE_SIMILARITY_THRESHOLD against an existing group
+        key is merged into that group; otherwise a new group is created.
 
         Args:
             analyses: List of analysis result dictionaries.
@@ -142,7 +144,17 @@ class ImageOrganizer:
         groups: dict[str, list[dict]] = {}
         for analysis in analyses:
             key = analysis.get("item_key", "unknown_item")
-            groups.setdefault(key, []).append(analysis)
+            best_existing_key = None
+            best_similarity = 0.0
+            for existing_key in groups:
+                sim = self._key_similarity(key, existing_key)
+                if sim > best_similarity:
+                    best_similarity = sim
+                    best_existing_key = existing_key
+            if best_existing_key is not None and best_similarity >= DUPLICATE_SIMILARITY_THRESHOLD:
+                groups[best_existing_key].append(analysis)
+            else:
+                groups.setdefault(key, []).append(analysis)
         return groups
 
     def detect_similar_groups(self, groups: dict[str, list[dict]]) -> list[str]:
