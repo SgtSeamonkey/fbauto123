@@ -117,11 +117,22 @@ class ItemCatalog:
         """
         Compute a combined similarity score between two items.
 
-        Weights: 70% canonical_text similarity + 30% item_key similarity.
+        Weights: 60% canonical_text similarity + 20% item_key character similarity
+        + 20% item_key token-overlap (Jaccard).  The Jaccard component makes
+        cross-run matching resilient to different word orderings in the key
+        (e.g. ``blue_ceramic_mug`` vs ``ceramic_blue_mug``).
         """
         text_score = SequenceMatcher(None, text_a.lower(), text_b.lower()).ratio()
         key_score = SequenceMatcher(None, key_a.lower(), key_b.lower()).ratio()
-        return 0.70 * text_score + 0.30 * key_score
+        tokens_a = set(key_a.lower().split("_"))
+        tokens_b = set(key_b.lower().split("_"))
+        if tokens_a and tokens_b:
+            intersection = tokens_a & tokens_b
+            union = tokens_a | tokens_b
+            token_score = len(intersection) / len(union)
+        else:
+            token_score = 0.0
+        return 0.60 * text_score + 0.20 * key_score + 0.20 * token_score
 
     # ------------------------------------------------------------------
     # Catalog management
